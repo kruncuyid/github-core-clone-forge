@@ -314,6 +314,46 @@ func issueNumberFromPath(parts []string) int {
 	return n
 }
 
+func issueGETParts(path string) (string, string, string, bool) {
+	path = strings.TrimRight(path, "/")
+	const prefix = "/api/v3/repos/"
+	if !strings.HasPrefix(path, prefix) { return "", "", "", false }
+	rest := path[len(prefix):]
+	slash := strings.IndexByte(rest, '/')
+	if slash <= 0 { return "", "", "", false }
+	owner := rest[:slash]
+	rest = rest[slash+1:]
+	slash = strings.IndexByte(rest, '/')
+	if slash <= 0 { return "", "", "", false }
+	name := rest[:slash]
+	rest = rest[slash+1:]
+	if strings.IndexByte(rest, '/') >= 0 { return "", "", "", false }
+	if !strings.HasPrefix(rest, "issues/") { return "", "", "", false }
+	number := rest[len("issues/"):]
+	if number == "" { return "", "", "", false }
+	return owner, name, number, true
+}
+
+func cachedIssueGET(path string) *Resp {
+	owner, name, numberText, ok := issueGETParts(path)
+	if !ok { return nil }
+	number, err := strconv.Atoi(numberText)
+	if err != nil || number < 1 { return nil }
+	repo := st.GetRepo(owner, name)
+	if repo == nil { return nil }
+	key := strconv.FormatUint(repo.Version, 10) + ":issue-get:" + numberText
+	if cached := cacheGetResp(repo, repo.RestCache, key); cached != nil { return cached }
+	var issue *Issue
+	for _, i := range repo.Issues {
+		if i.Number == number { issue = i; break }
+	}
+	if issue == nil { return nil }
+	resp := cachedIssueResponse(repo, issue)
+	if resp.Status != 200 { return nil }
+	cacheSetResp(repo, repo.RestCache, key, resp)
+	return &resp
+}
+
 func cachedIssueResponse(repo *Repo, issue *Issue) Resp {
 	key := strconv.FormatUint(repo.Version, 10) + ":" + strconv.Itoa(issue.Number)
 	if b := cacheGet(repo, repo.IssueCache, key); b != nil {

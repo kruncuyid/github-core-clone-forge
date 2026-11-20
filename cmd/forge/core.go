@@ -155,10 +155,11 @@ type Repo struct {
 	NextPull      int
 	Parents       map[string][]string
 	Version       uint64
-	CacheMu       sync.Mutex
+	CacheMu       sync.RWMutex
 	AdCache       map[string][]byte
 	FetchCache    map[string][]byte
 	IssueCache    map[string][]byte
+	RestCache     map[string]Resp
 }
 
 type State struct {
@@ -848,7 +849,7 @@ func (s *State) CreateRepo(owner, name string, private bool, description string)
 		Refs: map[string]string{}, Objects: map[string]*ForgeObject{}, Issues: []*Issue{}, Pulls: []*Pull{},
 		Labels: []string{"bug", "enhancement", "documentation", "question", "good first issue", "help wanted"},
 		NextIssue: 1, NextPull: 1, Parents: map[string][]string{},
-		AdCache: map[string][]byte{}, FetchCache: map[string][]byte{}, IssueCache: map[string][]byte{},
+		AdCache: map[string][]byte{}, FetchCache: map[string][]byte{}, IssueCache: map[string][]byte{}, RestCache: map[string]Resp{},
 	}
 	key := repoKey(owner, name)
 	s.repos[key] = r
@@ -890,13 +891,27 @@ func deleteRef(repo *Repo, ref string) {
 func bump(repo *Repo) { repo.Version++ }
 
 func cacheGet(repo *Repo, cache map[string][]byte, key string) []byte {
-	repo.CacheMu.Lock()
+	repo.CacheMu.RLock()
 	v := cache[key]
-	repo.CacheMu.Unlock()
+	repo.CacheMu.RUnlock()
 	return v
 }
 
 func cacheSet(repo *Repo, cache map[string][]byte, key string, value []byte) {
+	repo.CacheMu.Lock()
+	cache[key] = value
+	repo.CacheMu.Unlock()
+}
+
+func cacheGetResp(repo *Repo, cache map[string]Resp, key string) *Resp {
+	repo.CacheMu.RLock()
+	v, ok := cache[key]
+	repo.CacheMu.RUnlock()
+	if !ok { return nil }
+	return &v
+}
+
+func cacheSetResp(repo *Repo, cache map[string]Resp, key string, value Resp) {
 	repo.CacheMu.Lock()
 	cache[key] = value
 	repo.CacheMu.Unlock()

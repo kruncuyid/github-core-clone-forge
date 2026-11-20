@@ -3,11 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
@@ -53,9 +52,34 @@ func jsonError(status int, message string) Resp {
 	return jresp(status, map[string]any{"message": message}, nil)
 }
 
-var gitPathRE = regexp.MustCompile(`^/([^/]+)/([^/]+)\.git/(info/refs|git-upload-pack|git-receive-pack)$`)
+type gitPathInfo struct {
+	owner    string
+	name     string
+	endpoint string
+}
 
-func isGitPath(path string) bool { return gitPathRE.MatchString(path) }
+func parseGitPath(path string) (gitPathInfo, bool) {
+	endpoint := ""
+	for _, candidate := range []string{"/info/refs", "/git-upload-pack", "/git-receive-pack"} {
+		if strings.HasSuffix(path, candidate) {
+			endpoint = strings.TrimPrefix(candidate, "/")
+			path = strings.TrimSuffix(path, candidate)
+			break
+		}
+	}
+	if endpoint == "" || !strings.HasPrefix(path, "/") { return gitPathInfo{}, false }
+	rest := path[1:]
+	slash := strings.IndexByte(rest, '/')
+	if slash <= 0 { return gitPathInfo{}, false }
+	owner := rest[:slash]
+	rest = rest[slash+1:]
+	if strings.IndexByte(rest, '/') >= 0 || !strings.HasSuffix(rest, ".git") { return gitPathInfo{}, false }
+	name := rest[:len(rest)-4]
+	if owner == "" || name == "" { return gitPathInfo{}, false }
+	return gitPathInfo{owner: owner, name: name, endpoint: endpoint}, true
+}
+
+func isGitPath(path string) bool { _, ok := parseGitPath(path); return ok }
 
 func authorized(r *http.Request) bool {
 	fields := strings.Fields(r.Header.Get("Authorization"))
@@ -66,8 +90,8 @@ func authorized(r *http.Request) bool {
 func lockFor(method, path string) func() {
 	switch {
 	case isGitPath(path):
-		m := gitPathRE.FindStringSubmatch(path)
-		if method == "POST" && len(m) > 3 && m[3] == "git-receive-pack" {
+		git, _ := parseGitPath(path)
+		if method == "POST" && git.endpoint == "git-receive-pack" {
 			st.mu.Lock()
 			return st.mu.Unlock
 		}
@@ -94,13 +118,18 @@ func lockFor(method, path string) func() {
 }
 
 func serveHTTP(w http.ResponseWriter, r *http.Request) {
-	reqID := fmt.Sprintf("req-%d", atomic.AddUint64(&st.req, 1))
+	var idbuf [32]byte
+	reqID := "req-" + string(strconv.AppendUint(idbuf[:0], atomic.AddUint64(&st.req, 1), 10))
 	path := r.URL.EscapedPath()
 	if path == "" { path = "/" }
-	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
-	if err != nil {
-		writeResp(w, jsonError(500, "Internal Server Error"), reqID)
-		return
+	var body []byte
+	if (r.Method != "GET" && r.Method != "HEAD") || r.ContentLength > 0 {
+		var err error
+		body, err = io.ReadAll(io.LimitReader(r.Body, 64<<20))
+		if err != nil {
+			writeResp(w, jsonError(500, "Internal Server Error"), reqID)
+			return
+		}
 	}
 	unlock := lockFor(r.Method, path)
 	resp := routeLocked(r, path, body, reqID)
@@ -120,6 +149,9 @@ func routeLocked(r *http.Request, path string, body []byte, reqID string) Resp {
 
 	if strings.HasPrefix(path, "/api/v3") {
 		if !authorized(r) { return jsonError(401, "Requires authentication") }
+		if method == "GET" && r.URL.RawQuery == "" && strings.HasPrefix(path, "/api/v3/repos/") {
+			if fast := cachedIssueGET(path); fast != nil { return *fast }
+		}
 		apiURL := *r.URL
 		if apiURL.Scheme == "" { apiURL.Scheme = "http" }
 		if apiURL.Host == "" { apiURL.Host = r.Host }
@@ -152,14 +184,14 @@ func routeLocked(r *http.Request, path string, body []byte, reqID string) Resp {
 }
 
 func gitRouteLocked(r *http.Request, path string, body []byte, reqID string) *Resp {
-	m := gitPathRE.FindStringSubmatch(path)
-	if m == nil { return nil }
-	owner, err1 := url.PathUnescape(m[1])
-	name, err2 := url.PathUnescape(m[2])
+	git, ok := parseGitPath(path)
+	if !ok { return nil }
+	owner, err1 := url.PathUnescape(git.owner)
+	name, err2 := url.PathUnescape(git.name)
 	if err1 != nil || err2 != nil { a := jsonError(404, "Not Found"); return &a }
 	repo := st.GetRepo(owner, name)
 	if repo == nil { a := jsonError(404, "Not Found"); return &a }
-	endpoint := m[3]
+	endpoint := git.endpoint
 	serviceParam := r.URL.Query().Get("service")
 	v2 := strings.Contains(r.Header.Get("Git-Protocol"), "version=2")
 	if r.Method == "GET" && endpoint == "info/refs" {
@@ -191,7 +223,7 @@ func writeResp(w http.ResponseWriter, resp Resp, reqID string) {
 	if w.Header().Get("x-github-request-id") == "" { w.Header().Set("x-github-request-id", reqID) }
 	if resp.Status != 204 && resp.Body != nil {
 		if w.Header().Get("content-type") == "" { w.Header().Set("content-type", "application/json; charset=utf-8") }
-		w.Header().Set("content-length", fmt.Sprint(len(resp.Body)))
+		w.Header().Set("content-length", strconv.Itoa(len(resp.Body)))
 	}
 	w.WriteHeader(resp.Status)
 	if resp.Status != 204 && resp.Body != nil { _, _ = w.Write(resp.Body) }
