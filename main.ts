@@ -7,19 +7,21 @@ if (ENV_URL === '') {
 }
 
 const REQUEST_TIMEOUT_MS = 30_000;
+const REGISTER_ROUTE = '/register';
+const DONE_ROUTE = '/done';
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 2_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-function retryDelay(attempt: number): number {
+function backoffForAttempt(attempt: number): number {
   return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
 }
 
 async function register(port: number): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      const res = await fetch(`${ENV_URL}/register`, {
+      const res = await fetch(`${ENV_URL}${REGISTER_ROUTE}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ port }),
@@ -30,21 +32,21 @@ async function register(port: number): Promise<void> {
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
     }
-    await sleep(retryDelay(attempt));
+    await sleep(backoffForAttempt(attempt));
   }
 }
 
 async function waitForDone(): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      const res = await fetch(`${ENV_URL}${DONE_ROUTE}`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
       if (res.ok) {
         const body = (await res.json()) as { done?: unknown };
         if (body.done === true) return;
       }
     } catch {
     }
-    await sleep(retryDelay(attempt));
+    await sleep(backoffForAttempt(attempt));
   }
 }
 
